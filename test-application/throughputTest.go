@@ -1,17 +1,22 @@
 package main
 
 import (
+	"context"
 	"crypto/x509"
+	"errors"
 	"fmt"
 	"math/rand"
 	"os"
 	"path"
+	"strings"
 	"time"
 
 	"github.com/hyperledger/fabric-gateway/pkg/client"
 	"github.com/hyperledger/fabric-gateway/pkg/identity"
+	"github.com/hyperledger/fabric-protos-go-apiv2/gateway"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/status"
 )
 
 const (
@@ -49,7 +54,7 @@ func main() {
 	defer gw.Close()
 
 	// Override default values for chaincode and channel name as they may differ in testing contexts.
-	chaincodeName := "blob"
+	chaincodeName := "strings"
 	if ccname := os.Getenv("CHAINCODE_NAME"); ccname != "" {
 		chaincodeName = ccname
 	}
@@ -64,16 +69,42 @@ func main() {
 
 	const test_data_size = 1024
 	const num_test_updates = 100
-	test_data := make([]byte, test_data_size)
-	// Fill test_data with random bytes; these do not need to be cryptographically random
-	rand.Read(test_data)
+	test_data := generateRandomStringBytes(test_data_size)
 	// Send a bunch of put updates, each targeting a different key, with the test data
-	// This should be timed to get the put throughput for fabric transactions
+	// Measure the total time taken and divide by the total number of bytes sent to get the throughput
+	beginTime := time.Now()
 	for i := 0; i < num_test_updates; i++ {
-		putBlobData(contract, fmt.Sprintf("testKey_%d", i), test_data)
+		putStringData(contract, fmt.Sprintf("testKey_%d", i), test_data)
 	}
+	endTime := time.Now()
+	totalDuration := endTime.Sub(beginTime)
+	throughputBps := (test_data_size * num_test_updates) / totalDuration.Seconds()
+	throughputOps := num_test_updates / totalDuration.Seconds()
+	fmt.Printf("Duration: %v\nThroughput: %v bytes/sec (%v KB/s)\nOperations: %v ops",
+		totalDuration, throughputBps, (throughputBps / 1024), throughputOps)
 	// Confirm that the last update exists
-	getBlobData(contract, fmt.Sprintf("testKey_%d", num_test_updates-1))
+	getStringData(contract, fmt.Sprintf("testKey_%d", num_test_updates-1))
+}
+
+// Generates a random string, but stores it in a byte array instead of a string
+func generateRandomStringBytes(length int) []byte {
+	const letters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890"
+	stringBytes := make([]byte, length)
+	for i := 0; i < length; i++ {
+		stringBytes[i] = letters[rand.Intn(len(letters))]
+	}
+	return stringBytes
+}
+
+// Generates a random alphanumeric string
+func generateRandomString(length int) string {
+	const letters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890"
+	stringBuilder := strings.Builder{}
+	stringBuilder.Grow(length)
+	for i := 0; i < length; i++ {
+		stringBuilder.WriteByte(letters[rand.Intn(len(letters))])
+	}
+	return stringBuilder.String()
 }
 
 // newGrpcConnection creates a gRPC connection to the Gateway server.
@@ -155,34 +186,36 @@ func readFirstFile(dirPath string) ([]byte, error) {
 }
 
 // Submit a transaction synchronously, blocking until it has been committed to the ledger.
-func putBlobData(contract *client.Contract, key string, data []byte) {
-	fmt.Printf("\n--> Submit Transaction: PutBlobData, with key = %s and data size %d \n", key, len(data))
+func putStringData(contract *client.Contract, key string, data []byte) {
+	fmt.Printf("\n--> Submit Transaction: PutString, with key = %s and data size %d \n", key, len(data))
 
-	_, err := contract.Submit("PutData", client.WithBytesArguments([]byte(key), data))
+	_, err := contract.Submit("PutString", client.WithBytesArguments([]byte(key), data))
 	if err != nil {
-		panic(fmt.Errorf("failed to submit transaction: %w", err))
+		printErrorDetails(err)
+		panic("Failed to submit the PutString transaction")
 	}
 
 	fmt.Printf("*** Transaction committed successfully\n")
 }
 
-func getBlobData(contract *client.Contract, key string) {
-	fmt.Printf("\n--> Evaluate Transaction: GetData, returns data associated with current version of key %s \n", key)
+func getStringData(contract *client.Contract, key string) {
+	fmt.Printf("\n--> Evaluate Transaction: GetString, returns data associated with current version of key %s \n", key)
 
-	result, err := contract.EvaluateTransaction("GetData", key)
+	result, err := contract.EvaluateTransaction("GetString", key)
 	if err != nil {
-		panic(fmt.Errorf("failed to evaluate transaction: %w", err))
+		printErrorDetails(err)
+		panic("Failed to evaluate the GetString transaction")
 	}
 
-	fmt.Printf("*** Got result: %x", result)
+	fmt.Printf("*** Got result: %s", result)
 }
 
 // Submit transaction asynchronously, blocking until the transaction has been sent to the orderer, and allowing
 // this thread to process the chaincode response (e.g. update a UI) without waiting for the commit notification
-func putBlobAsync(contract *client.Contract, key string, data []byte) {
-	fmt.Printf("\n--> Async Submit Transaction: PutBlobData, with key = %s and data size %d \n", key, len(data))
+func putAsync(contract *client.Contract, key string, data []byte) {
+	fmt.Printf("\n--> Async Submit Transaction: PutString, with key = %s and data size %d \n", key, len(data))
 
-	submitResult, commit, err := contract.SubmitAsync("PutData", client.WithBytesArguments([]byte(key), data))
+	submitResult, commit, err := contract.SubmitAsync("PutString", client.WithBytesArguments([]byte(key), data))
 	if err != nil {
 		panic(fmt.Errorf("failed to submit transaction asynchronously: %w", err))
 	}
@@ -197,4 +230,45 @@ func putBlobAsync(contract *client.Contract, key string, data []byte) {
 	}
 
 	fmt.Printf("*** Transaction committed successfully\n")
+}
+
+// Parses and unpacks the various types of errors that could result from a client.Contract method
+func printErrorDetails(err error) {
+	// Determine the type of error
+	var endorseErr *client.EndorseError
+	var submitErr *client.SubmitError
+	var commitStatusErr *client.CommitStatusError
+	var commitErr *client.CommitError
+
+	if errors.As(err, &endorseErr) {
+		fmt.Printf("Endorse error for transaction %s with gRPC status %v: %s\n", endorseErr.TransactionID, status.Code(endorseErr), endorseErr)
+	} else if errors.As(err, &submitErr) {
+		fmt.Printf("Submit error for transaction %s with gRPC status %v: %s\n", submitErr.TransactionID, status.Code(submitErr), submitErr)
+	} else if errors.As(err, &commitStatusErr) {
+		if errors.Is(err, context.DeadlineExceeded) {
+			fmt.Printf("Timeout waiting for transaction %s commit status: %s", commitStatusErr.TransactionID, commitStatusErr)
+		} else {
+			fmt.Printf("Error obtaining commit status for transaction %s with gRPC status %v: %s\n", commitStatusErr.TransactionID, status.Code(commitStatusErr), commitStatusErr)
+		}
+	} else if errors.As(err, &commitErr) {
+		fmt.Printf("Transaction %s failed to commit with status %d: %s\n", commitErr.TransactionID, int32(commitErr.Code), err)
+	} else {
+		panic(fmt.Errorf("unexpected error type %T: %w", err, err))
+	}
+
+	// Any error that originates from a peer or orderer node external to the gateway will have its details
+	// embedded within the gRPC status error. Extract the details so we can see what went wrong.
+	statusErr := status.Convert(err)
+
+	details := statusErr.Details()
+	if len(details) > 0 {
+		fmt.Println("Error Details:")
+
+		for _, detail := range details {
+			switch detail := detail.(type) {
+			case *gateway.ErrorDetail:
+				fmt.Printf("- address: %s, mspId: %s, message: %s\n", detail.Address, detail.MspId, detail.Message)
+			}
+		}
+	}
 }
