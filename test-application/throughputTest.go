@@ -1,13 +1,17 @@
 package main
 
 import (
+	"bufio"
 	"context"
 	"crypto/x509"
 	"errors"
+	"flag"
 	"fmt"
+	"log/slog"
 	"math/rand"
 	"os"
 	"path"
+	"strconv"
 	"strings"
 	"time"
 
@@ -21,7 +25,7 @@ import (
 
 const (
 	mspID        = "Org1MSP"
-	cryptoPath   = "/home/edward/go/src/github.com/etremel/fabric-samples/test-network/organizations/peerOrganizations/org1.example.com"
+	cryptoPath   = "../../fabric-samples/test-network/organizations/peerOrganizations/org1.example.com"
 	certPath     = cryptoPath + "/users/User1@org1.example.com/msp/signcerts"
 	keyPath      = cryptoPath + "/users/User1@org1.example.com/msp/keystore"
 	tlsCertPath  = cryptoPath + "/peers/peer0.org1.example.com/tls/ca.crt"
@@ -30,6 +34,30 @@ const (
 )
 
 func main() {
+	verbose := flag.Bool("v", false, "Verbose mode")
+	flag.Parse()
+	if *verbose {
+		slog.SetLogLoggerLevel(slog.LevelDebug)
+	} else {
+		slog.SetLogLoggerLevel(slog.LevelInfo)
+	}
+	if len(flag.Args()) < 2 {
+		fmt.Println("Error: Missing required arguments")
+		fmt.Printf("Usage: %s [-v] <data size> <num messages>\n", os.Args[0])
+		return
+	}
+	data_size_i64, parseErr := strconv.ParseInt(flag.Args()[0], 0, 0)
+	if parseErr != nil {
+		panic(fmt.Errorf("failed to parse argument 1 as an int: %w", parseErr))
+	}
+	num_updates_i64, parseErr := strconv.ParseInt(flag.Args()[1], 0, 0)
+	if parseErr != nil {
+		panic(fmt.Errorf("failed to parse argument 2 as an int: %w", parseErr))
+	}
+	// Annoyingly, ParseInt always returns an int64, which must be cast to the correct type
+	test_data_size := int(data_size_i64)
+	num_test_updates := int(num_updates_i64)
+
 	// The gRPC client connection should be shared by all Gateway connections to this endpoint
 	clientConnection := newGrpcConnection()
 	defer clientConnection.Close()
@@ -67,23 +95,73 @@ func main() {
 	network := gw.GetNetwork(channelName)
 	contract := network.GetContract(chaincodeName)
 
-	const test_data_size = 1024
-	const num_test_updates = 100
-	test_data := generateRandomStringBytes(test_data_size)
-	// Send a bunch of put updates, each targeting a different key, with the test data
+	const workload_size = 1024
+	workloadObjects := generateWorkload(workload_size, test_data_size)
+	putCommitChannel := make(chan *client.Commit, num_test_updates)
+	doneChannel := make(chan bool)
+	sendTimes := make([]time.Time, num_test_updates)
+	commitTimes := make([]time.Time, num_test_updates)
+	// Start a thread to receive commit pointers from the SubmitAsync calls and wait on them
+	go collectStatuses(putCommitChannel, commitTimes, doneChannel)
+	// Send a bunch of put updates, each targeting a random key, with the test data
 	// Measure the total time taken and divide by the total number of bytes sent to get the throughput
 	beginTime := time.Now()
-	for i := 0; i < num_test_updates; i++ {
-		putStringData(contract, fmt.Sprintf("testKey_%d", i), test_data)
+	for i := range num_test_updates {
+		testObjectKey := fmt.Sprintf("testKey_%d", rand.Intn(len(workloadObjects)))
+		sendTimes[i] = time.Now()
+		putCommitChannel <- putStringAsync(contract, testObjectKey, workloadObjects[testObjectKey])
 	}
+	// Wait for the collectStatuses thread to finish
+	<-doneChannel
 	endTime := time.Now()
 	totalDuration := endTime.Sub(beginTime)
-	throughputBps := (test_data_size * num_test_updates) / totalDuration.Seconds()
-	throughputOps := num_test_updates / totalDuration.Seconds()
-	fmt.Printf("Duration: %v\nThroughput: %v bytes/sec (%v KB/s)\nOperations: %v ops",
+	throughputBps := float64(test_data_size*num_test_updates) / totalDuration.Seconds()
+	throughputOps := float64(num_test_updates) / totalDuration.Seconds()
+	fmt.Printf("Duration: %v\nThroughput: %v bytes/sec (%v KB/s)\nOperations: %v ops\n",
 		totalDuration, throughputBps, (throughputBps / 1024), throughputOps)
-	// Confirm that the last update exists
-	getStringData(contract, fmt.Sprintf("testKey_%d", num_test_updates-1))
+	saveTimestampFile(sendTimes, commitTimes)
+}
+
+func collectStatuses(commitChannel chan *client.Commit, commitTimes []time.Time, done chan bool) {
+	for i := range len(commitTimes) {
+		commitPtr := <-commitChannel
+		commitStatus, err := commitPtr.Status()
+		if err != nil {
+			panic(fmt.Errorf("put transaction %v failed to commit with error: %w", i, err))
+		}
+		if !commitStatus.Successful {
+			panic(fmt.Errorf("put transaction %v failed to commit, status was %+v", i, commitStatus))
+		}
+		commitTimes[i] = time.Now()
+		slog.Debug(fmt.Sprintf("Transaction #%v finished with commit status %+v\n", i, commitStatus))
+	}
+	done <- true
+}
+
+func saveTimestampFile(sendTimes []time.Time, commitTimes []time.Time) {
+	const TLT_READY_TO_SEND = 11000
+	const TLT_EC_SIGNATURE_NOTIFY = 12002
+	f, err := os.Create("timestamp.log")
+	if err != nil {
+		panic(fmt.Errorf("could not open timestamp.log file for writing: %w", err))
+	}
+	defer f.Close()
+	fileWriter := bufio.NewWriter(f)
+	for i := range len(sendTimes) {
+		fileWriter.WriteString(fmt.Sprintf("%d %d %d\n", TLT_READY_TO_SEND, i, sendTimes[i].UnixNano()))
+	}
+	for i := range len(commitTimes) {
+		fileWriter.WriteString(fmt.Sprintf("%d %d %d\n", TLT_EC_SIGNATURE_NOTIFY, i, commitTimes[i].UnixNano()))
+	}
+	fileWriter.Flush()
+}
+
+func generateWorkload(numObjects int, size int) map[string][]byte {
+	workloadMap := make(map[string][]byte)
+	for i := range numObjects {
+		workloadMap[fmt.Sprintf("testKey_%d", i)] = generateRandomStringBytes(size)
+	}
+	return workloadMap
 }
 
 // Generates a random string, but stores it in a byte array instead of a string
@@ -187,7 +265,7 @@ func readFirstFile(dirPath string) ([]byte, error) {
 
 // Submit a transaction synchronously, blocking until it has been committed to the ledger.
 func putStringData(contract *client.Contract, key string, data []byte) {
-	fmt.Printf("\n--> Submit Transaction: PutString, with key = %s and data size %d \n", key, len(data))
+	slog.Debug(fmt.Sprintf("\n--> Submit Transaction: PutString, with key = %s and data size %d \n", key, len(data)))
 
 	_, err := contract.Submit("PutString", client.WithBytesArguments([]byte(key), data))
 	if err != nil {
@@ -195,11 +273,11 @@ func putStringData(contract *client.Contract, key string, data []byte) {
 		panic("Failed to submit the PutString transaction")
 	}
 
-	fmt.Printf("*** Transaction committed successfully\n")
+	slog.Debug(fmt.Sprintf("*** Transaction committed successfully\n"))
 }
 
 func getStringData(contract *client.Contract, key string) {
-	fmt.Printf("\n--> Evaluate Transaction: GetString, returns data associated with current version of key %s \n", key)
+	slog.Debug(fmt.Sprintf("\n--> Evaluate Transaction: GetString, returns data associated with current version of key %s \n", key))
 
 	result, err := contract.EvaluateTransaction("GetString", key)
 	if err != nil {
@@ -207,7 +285,17 @@ func getStringData(contract *client.Contract, key string) {
 		panic("Failed to evaluate the GetString transaction")
 	}
 
-	fmt.Printf("*** Got result: %s", result)
+	slog.Debug(fmt.Sprintf("*** Got result: %s", result))
+}
+
+func putStringAsync(contract *client.Contract, key string, data []byte) *client.Commit {
+	slog.Debug(fmt.Sprintf("Submitting async put with key %s", key))
+	_, commit, err := contract.SubmitAsync("PutString", client.WithBytesArguments([]byte(key), data))
+	if err != nil {
+		printErrorDetails(err)
+		panic("Failed to submit transaction asynchronously")
+	}
+	return commit
 }
 
 // Submit transaction asynchronously, blocking until the transaction has been sent to the orderer, and allowing
@@ -241,19 +329,19 @@ func printErrorDetails(err error) {
 	var commitErr *client.CommitError
 
 	if errors.As(err, &endorseErr) {
-		fmt.Printf("Endorse error for transaction %s with gRPC status %v: %s\n", endorseErr.TransactionID, status.Code(endorseErr), endorseErr)
+		slog.Error(fmt.Sprintf("Endorse error for transaction %s with gRPC status %v: %s\n", endorseErr.TransactionID, status.Code(endorseErr), endorseErr))
 	} else if errors.As(err, &submitErr) {
-		fmt.Printf("Submit error for transaction %s with gRPC status %v: %s\n", submitErr.TransactionID, status.Code(submitErr), submitErr)
+		slog.Error(fmt.Sprintf("Submit error for transaction %s with gRPC status %v: %s\n", submitErr.TransactionID, status.Code(submitErr), submitErr))
 	} else if errors.As(err, &commitStatusErr) {
 		if errors.Is(err, context.DeadlineExceeded) {
-			fmt.Printf("Timeout waiting for transaction %s commit status: %s", commitStatusErr.TransactionID, commitStatusErr)
+			slog.Error(fmt.Sprintf("Timeout waiting for transaction %s commit status: %s", commitStatusErr.TransactionID, commitStatusErr))
 		} else {
-			fmt.Printf("Error obtaining commit status for transaction %s with gRPC status %v: %s\n", commitStatusErr.TransactionID, status.Code(commitStatusErr), commitStatusErr)
+			slog.Error(fmt.Sprintf("Error obtaining commit status for transaction %s with gRPC status %v: %s\n", commitStatusErr.TransactionID, status.Code(commitStatusErr), commitStatusErr))
 		}
 	} else if errors.As(err, &commitErr) {
-		fmt.Printf("Transaction %s failed to commit with status %d: %s\n", commitErr.TransactionID, int32(commitErr.Code), err)
+		slog.Error(fmt.Sprintf("Transaction %s failed to commit with status %d: %s\n", commitErr.TransactionID, int32(commitErr.Code), err))
 	} else {
-		panic(fmt.Errorf("unexpected error type %T: %w", err, err))
+		slog.Error(fmt.Sprintf("unexpected error type %T: %v", err, err))
 	}
 
 	// Any error that originates from a peer or orderer node external to the gateway will have its details
@@ -262,12 +350,12 @@ func printErrorDetails(err error) {
 
 	details := statusErr.Details()
 	if len(details) > 0 {
-		fmt.Println("Error Details:")
+		slog.Error(fmt.Sprintln("Error Details:"))
 
 		for _, detail := range details {
 			switch detail := detail.(type) {
 			case *gateway.ErrorDetail:
-				fmt.Printf("- address: %s, mspId: %s, message: %s\n", detail.Address, detail.MspId, detail.Message)
+				slog.Error(fmt.Sprintf("- address: %s, mspId: %s, message: %s\n", detail.Address, detail.MspId, detail.Message))
 			}
 		}
 	}
