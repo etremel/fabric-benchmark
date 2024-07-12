@@ -1,0 +1,68 @@
+# Copyright IBM Corp. All Rights Reserved.
+#
+# SPDX-License-Identifier: Apache-2.0
+#
+
+# ---------------------------------------------------------------------------
+# "OrdererOrgs" - Definition of organizations managing orderer nodes
+# ---------------------------------------------------------------------------
+OrdererOrgs:
+  - Name: Orderer
+    Domain: example.com
+    EnableNodeOUs: true
+
+    Specs:
+      - Hostname: orderer
+        SANS:
+          - 128.84.139.28
+          - compute32.fractus.cs.cornell.edu
+      - Hostname: orderer2
+        SANS:
+          - 128.84.139.27
+          - compute31.fractus.cs.cornell.edu
+      - Hostname: orderer3
+        SANS:
+          - 128.84.139.26
+          - compute30.fractus.cs.cornell.edu
+
+# ---------------------------------------------------------------------------
+# "PeerOrgs" - Definition of organizations managing peer nodes
+# ---------------------------------------------------------------------------
+PeerOrgs:
+  - Name: Org1
+    Domain: org1.example.com
+    EnableNodeOUs: true
+
+    Specs:
+      - Hostname: peer0
+        SANS:
+          - 128.84.139.25
+          - compute29.fractus.cs.cornell.edu
+      - Hostname: peer1
+        SANS:
+          - 128.84.139.24
+          - compute28.fractus.cs.cornell.edu
+      - Hostname: peer2
+        SANS:
+          - 128.84.139.21
+          - compute25.fractus.cs.cornell.edu
+
+    Users:
+      Count: 1
+
+  - Name: Org2
+    Domain: org2.example.com
+    EnableNodeOUs: true
+
+    Specs:
+      - Hostname: peer0
+        SANS:
+          - 128.84.139.23
+          - compute27.fractus.cs.cornell.edu
+      - Hostname: peer1
+        SANS:
+          - 128.84.139.22
+          - compute26.fractus.cs.cornell.edu
+
+    Users:
+      Count: 1

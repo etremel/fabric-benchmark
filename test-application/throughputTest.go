@@ -24,13 +24,15 @@ import (
 )
 
 const (
-	mspID        = "Org1MSP"
-	cryptoPath   = "../../fabric-samples/test-network/organizations/peerOrganizations/org1.example.com"
-	certPath     = cryptoPath + "/users/User1@org1.example.com/msp/signcerts"
-	keyPath      = cryptoPath + "/users/User1@org1.example.com/msp/keystore"
-	tlsCertPath  = cryptoPath + "/peers/peer0.org1.example.com/tls/ca.crt"
-	peerEndpoint = "dns:///localhost:7051"
-	gatewayPeer  = "peer0.org1.example.com"
+	mspID         = "Org1MSP"
+	cryptoPath    = "../../fabric-samples/config/crypto-config/peerOrganizations/org1.example.com"
+	certPath      = cryptoPath + "/users/User1@org1.example.com/msp/signcerts"
+	keyPath       = cryptoPath + "/users/User1@org1.example.com/msp/keystore"
+	tlsCertPath   = cryptoPath + "/peers/peer0.org1.example.com/tls/ca.crt"
+	peerEndpoint  = "dns:///128.84.139.25:7051"
+	gatewayPeer   = "peer0.org1.example.com"
+	chaincodeName = "plain_string"
+	channelName   = "mychannel"
 )
 
 func main() {
@@ -80,17 +82,6 @@ func main() {
 		panic(err)
 	}
 	defer gw.Close()
-
-	// Override default values for chaincode and channel name as they may differ in testing contexts.
-	chaincodeName := "strings"
-	if ccname := os.Getenv("CHAINCODE_NAME"); ccname != "" {
-		chaincodeName = ccname
-	}
-
-	channelName := "mychannel"
-	if cname := os.Getenv("CHANNEL_NAME"); cname != "" {
-		channelName = cname
-	}
 
 	network := gw.GetNetwork(channelName)
 	contract := network.GetContract(chaincodeName)
