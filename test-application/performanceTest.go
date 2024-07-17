@@ -37,28 +37,52 @@ const (
 
 func main() {
 	verbose := flag.Bool("v", false, "Verbose mode")
+	testType := flag.String("testType", "throughput", "Type of test to run (throughput or latency)")
 	flag.Parse()
 	if *verbose {
 		slog.SetLogLoggerLevel(slog.LevelDebug)
 	} else {
 		slog.SetLogLoggerLevel(slog.LevelInfo)
 	}
-	if len(flag.Args()) < 2 {
-		fmt.Println("Error: Missing required arguments")
-		fmt.Printf("Usage: %s [-v] <data size> <num messages>\n", os.Args[0])
+	if !(strings.EqualFold(*testType, "throughput") || strings.EqualFold(*testType, "latency")) {
+		fmt.Println("Unknown test type: " + *testType)
 		return
 	}
+	if strings.EqualFold(*testType, "throughput") && len(flag.Args()) < 2 {
+		fmt.Println("Error: Missing required arguments")
+		fmt.Printf("Usage: %s [-v] --testType throughput <data size> <num messages>\n", os.Args[0])
+		return
+	}
+	if strings.EqualFold(*testType, "latency") && len(flag.Args()) < 3 {
+		fmt.Println("Error: Missing required arguments")
+		fmt.Printf("Usage: %s [-v] --testType latency <data size> <message rate> <test duration>\n", os.Args[0])
+		return
+	}
+
 	data_size_i64, parseErr := strconv.ParseInt(flag.Args()[0], 0, 0)
 	if parseErr != nil {
 		panic(fmt.Errorf("failed to parse argument 1 as an int: %w", parseErr))
 	}
-	num_updates_i64, parseErr := strconv.ParseInt(flag.Args()[1], 0, 0)
+	// Annoyingly, ParseInt always returns an int64, which must be cast to the correct type
+	test_data_size := int(data_size_i64)
+	// Parse arguments 2 and 3 depending on which type of test is requested
+	var num_test_updates int
+	var message_rate int
+	var test_duration_seconds int
+	arg2_i64, parseErr := strconv.ParseInt(flag.Args()[1], 0, 0)
 	if parseErr != nil {
 		panic(fmt.Errorf("failed to parse argument 2 as an int: %w", parseErr))
 	}
-	// Annoyingly, ParseInt always returns an int64, which must be cast to the correct type
-	test_data_size := int(data_size_i64)
-	num_test_updates := int(num_updates_i64)
+	if strings.EqualFold(*testType, "throughput") {
+		num_test_updates = int(arg2_i64)
+	} else if strings.EqualFold(*testType, "latency") {
+		message_rate = int(arg2_i64)
+		duration_i64, parseErr := strconv.ParseInt(flag.Args()[2], 0, 0)
+		if parseErr != nil {
+			panic(fmt.Errorf("failed to parse argument 3 as an int: %w", parseErr))
+		}
+		test_duration_seconds = int(duration_i64)
+	}
 
 	// The gRPC client connection should be shared by all Gateway connections to this endpoint
 	clientConnection := newGrpcConnection()
@@ -88,12 +112,20 @@ func main() {
 
 	const workload_size = 1024
 	workloadObjects := generateWorkload(workload_size, test_data_size)
+	if strings.EqualFold(*testType, "throughput") {
+		throughputTest(workloadObjects, contract, num_test_updates)
+	} else if strings.EqualFold(*testType, "latency") {
+		latencyTest(workloadObjects, contract, message_rate, time.Duration(test_duration_seconds)*time.Second)
+	}
+}
+
+func throughputTest(workloadObjects map[string][]byte, contract *client.Contract, num_test_updates int) {
 	putCommitChannel := make(chan *client.Commit, num_test_updates)
 	doneChannel := make(chan bool)
 	sendTimes := make([]time.Time, num_test_updates)
 	commitTimes := make([]time.Time, num_test_updates)
 	// Start a thread to receive commit pointers from the SubmitAsync calls and wait on them
-	go collectStatuses(putCommitChannel, commitTimes, doneChannel)
+	go collectStatusesFixed(putCommitChannel, commitTimes, doneChannel)
 	// Send a bunch of put updates, each targeting a random key, with the test data
 	// Measure the total time taken and divide by the total number of bytes sent to get the throughput
 	beginTime := time.Now()
@@ -106,14 +138,48 @@ func main() {
 	<-doneChannel
 	endTime := time.Now()
 	totalDuration := endTime.Sub(beginTime)
-	throughputBps := float64(test_data_size*num_test_updates) / totalDuration.Seconds()
+	throughputBps := float64(len(workloadObjects["testKey_0"])*num_test_updates) / totalDuration.Seconds()
 	throughputOps := float64(num_test_updates) / totalDuration.Seconds()
 	fmt.Printf("Duration: %v\nThroughput: %v bytes/sec (%v KB/s)\nOperations: %v ops\n",
 		totalDuration, throughputBps, (throughputBps / 1024), throughputOps)
 	saveTimestampFile(sendTimes, commitTimes)
 }
 
-func collectStatuses(commitChannel chan *client.Commit, commitTimes []time.Time, done chan bool) {
+func latencyTest(workloadObjects map[string][]byte, contract *client.Contract, messages_per_second int, test_duration time.Duration) {
+	putCommitChannel := make(chan *client.Commit, messages_per_second*int(test_duration.Seconds()))
+	doneChannel := make(chan bool)
+	lastMessageChannel := make(chan int)
+	sendTimes := make([]time.Time, 0, messages_per_second*int(test_duration.Seconds()))
+	commitTimes := make([]time.Time, 0, messages_per_second*int(test_duration.Seconds()))
+	loopInterval := time.Second / time.Duration(messages_per_second)
+	// Debugging: Check my time math
+	slog.Debug(fmt.Sprintf("Test duration %v, sending %v messages per second, so loop interval is %v", test_duration, messages_per_second, loopInterval))
+	// Start a thread to receive commit pointers from the SubmitAsync calls and wait on them
+	go collectStatusesFlexible(putCommitChannel, commitTimes, lastMessageChannel, doneChannel)
+	messageCounter := 0
+	// Loop for the requested test duration
+	endTime := time.Now().Add(test_duration)
+	lastSentTime := time.Now()
+	for time.Now().Before(endTime) {
+		testObjectKey := fmt.Sprintf("testKey_%d", rand.Intn(len(workloadObjects)))
+		waitTime := time.Until(lastSentTime.Add(loopInterval))
+		if waitTime < 0 {
+			slog.Warn("Send interval time has already elapsed, not sending at requested rate!")
+		}
+		time.Sleep(waitTime)
+		lastSentTime = time.Now()
+		sendTimes = append(sendTimes, lastSentTime)
+		putCommitChannel <- putStringAsync(contract, testObjectKey, workloadObjects[testObjectKey])
+		messageCounter++
+	}
+	// Tell the collect-statuses thread what the last message number is
+	lastMessageChannel <- messageCounter
+	// Wait for it to be done
+	<-doneChannel
+	saveTimestampFile(sendTimes, commitTimes)
+}
+
+func collectStatusesFixed(commitChannel <-chan *client.Commit, commitTimes []time.Time, done chan<- bool) {
 	for i := range len(commitTimes) {
 		commitPtr := <-commitChannel
 		commitStatus, err := commitPtr.Status()
@@ -125,6 +191,37 @@ func collectStatuses(commitChannel chan *client.Commit, commitTimes []time.Time,
 		}
 		commitTimes[i] = time.Now()
 		slog.Debug(fmt.Sprintf("Transaction #%v finished with commit status %+v\n", i, commitStatus))
+	}
+	done <- true
+}
+
+func collectStatusesFlexible(commitChannel <-chan *client.Commit, commitTimes []time.Time,
+	lastMessageChannel <-chan int, done chan<- bool) {
+	messageCounter := 0
+	var lastMessageNum int
+	lastMessageNumReceived := false
+	for {
+		commitPtr := <-commitChannel
+		commitStatus, err := commitPtr.Status()
+		if err != nil {
+			panic(fmt.Errorf("put transaction %v failed to commit with error: %w", messageCounter, err))
+		}
+		if !commitStatus.Successful {
+			panic(fmt.Errorf("put transaction %v failed to commit, status was %+v", messageCounter, commitStatus))
+		}
+		commitTimes = append(commitTimes, time.Now())
+		slog.Debug(fmt.Sprintf("Transaction #%v finished with commit status %+v\n", messageCounter, commitStatus))
+		select {
+		case lastMessageNum = <-lastMessageChannel:
+			slog.Debug(fmt.Sprintf("Last message number received, it is %v", lastMessageNum))
+			lastMessageNumReceived = true
+		default:
+			// continue
+		}
+		if lastMessageNumReceived && messageCounter == lastMessageNum {
+			break
+		}
+		messageCounter++
 	}
 	done <- true
 }
@@ -287,28 +384,6 @@ func putStringAsync(contract *client.Contract, key string, data []byte) *client.
 		panic("Failed to submit transaction asynchronously")
 	}
 	return commit
-}
-
-// Submit transaction asynchronously, blocking until the transaction has been sent to the orderer, and allowing
-// this thread to process the chaincode response (e.g. update a UI) without waiting for the commit notification
-func putAsync(contract *client.Contract, key string, data []byte) {
-	fmt.Printf("\n--> Async Submit Transaction: PutString, with key = %s and data size %d \n", key, len(data))
-
-	submitResult, commit, err := contract.SubmitAsync("PutString", client.WithBytesArguments([]byte(key), data))
-	if err != nil {
-		panic(fmt.Errorf("failed to submit transaction asynchronously: %w", err))
-	}
-
-	fmt.Printf("\n*** Successfully submitted transaction to update key with new data, returned result was %s. \n", string(submitResult))
-	fmt.Println("*** Waiting for transaction commit.")
-
-	if commitStatus, err := commit.Status(); err != nil {
-		panic(fmt.Errorf("failed to get commit status: %w", err))
-	} else if !commitStatus.Successful {
-		panic(fmt.Errorf("transaction %s failed to commit with status: %d", commitStatus.TransactionID, int32(commitStatus.Code)))
-	}
-
-	fmt.Printf("*** Transaction committed successfully\n")
 }
 
 // Parses and unpacks the various types of errors that could result from a client.Contract method

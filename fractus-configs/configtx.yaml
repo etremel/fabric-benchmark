@@ -91,7 +91,7 @@ Organizations:
       # AnchorPeers defines the location of peers which can be used
       # for cross org gossip communication.  Note, this value is only
       # encoded in the genesis block in the Application section context
-      - Host: 128.84.139.23
+      - Host: 128.84.139.22
         Port: 7051
 ################################################################################
 #
