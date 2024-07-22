@@ -24,20 +24,45 @@ import (
 )
 
 const (
-	mspID         = "Org1MSP"
-	cryptoPath    = "../../fabric-samples/config/crypto-config/peerOrganizations/org1.example.com"
-	certPath      = cryptoPath + "/users/User1@org1.example.com/msp/signcerts"
-	keyPath       = cryptoPath + "/users/User1@org1.example.com/msp/keystore"
-	tlsCertPath   = cryptoPath + "/peers/peer0.org1.example.com/tls/ca.crt"
-	peerEndpoint  = "dns:///128.84.139.25:7051"
-	gatewayPeer   = "peer0.org1.example.com"
-	chaincodeName = "plain_string"
-	channelName   = "mychannel"
+	mspID                = "Org1MSP"
+	orgCryptoPath        = "peerOrganizations/org1.example.com"
+	userCertsSuffix      = "users/User1@org1.example.com/msp/signcerts"
+	userKeysSuffix       = "users/User1@org1.example.com/msp/keystore"
+	tlsCertSuffix        = "peers/peer0.org1.example.com/tls/ca.crt"
+	defaultChaincodeName = "plain_string"
+	defaultChannelName   = "mychannel"
+	gatewayPeer          = "peer0.org1.example.com"
+	workloadSize         = 1024
+	timestampFileName    = "timestamp.log"
 )
+
+type TestClient struct {
+	cryptoPath       string
+	certPath         string
+	keyPath          string
+	tlsCertPath      string
+	peerEndpoint     string
+	workloadObjects  map[string][]byte
+	sendTimes        []time.Time
+	commitTimes      []time.Time
+	clientConnection *grpc.ClientConn
+	gateway          *client.Gateway
+	contract         *client.Contract
+}
 
 func main() {
 	verbose := flag.Bool("v", false, "Verbose mode")
 	testType := flag.String("testType", "throughput", "Type of test to run (throughput or latency)")
+	// The default value for cryptoDir is FABRIC_CFG_PATH/crypto-config,
+	// or ~/fabric-samples/config if FABRIC_CFG_PATH is not set
+	fabricConfDir := os.Getenv("FABRIC_CFG_PATH")
+	if fabricConfDir == "" {
+		home, _ := os.UserHomeDir()
+		fabricConfDir = path.Join(home, "fabric-samples", "config")
+	}
+	cryptoDir := flag.String("c", path.Join(fabricConfDir, "crypto-config"), "Root directory of the certificates directory")
+	chaincodeName := flag.String("chaincode", defaultChaincodeName, "Name of the chaincode to invoke transactions on for testing")
+	channelName := flag.String("channel", defaultChannelName, "Name of the channel the test organizations have joined")
 	flag.Parse()
 	if *verbose {
 		slog.SetLogLoggerLevel(slog.LevelDebug)
@@ -48,54 +73,62 @@ func main() {
 		fmt.Println("Unknown test type: " + *testType)
 		return
 	}
-	if strings.EqualFold(*testType, "throughput") && len(flag.Args()) < 2 {
+	if strings.EqualFold(*testType, "throughput") && len(flag.Args()) < 3 {
 		fmt.Println("Error: Missing required arguments")
-		fmt.Printf("Usage: %s [-v] --testType throughput <data size> <num messages>\n", os.Args[0])
+		fmt.Printf("Usage: %s --testType throughput <data size> <num messages> <peer IP>\n", os.Args[0])
 		return
 	}
-	if strings.EqualFold(*testType, "latency") && len(flag.Args()) < 3 {
+	if strings.EqualFold(*testType, "latency") && len(flag.Args()) < 4 {
 		fmt.Println("Error: Missing required arguments")
-		fmt.Printf("Usage: %s [-v] --testType latency <data size> <message rate> <test duration>\n", os.Args[0])
+		fmt.Printf("Usage: %s --testType latency <data size> <message rate> <test duration> <peer IP>\n", os.Args[0])
 		return
 	}
-
-	data_size_i64, parseErr := strconv.ParseInt(flag.Args()[0], 0, 0)
+	dataSize_i64, parseErr := strconv.ParseInt(flag.Arg(0), 0, 0)
 	if parseErr != nil {
 		panic(fmt.Errorf("failed to parse argument 1 as an int: %w", parseErr))
 	}
 	// Annoyingly, ParseInt always returns an int64, which must be cast to the correct type
-	test_data_size := int(data_size_i64)
+	testDataSize := int(dataSize_i64)
 	// Parse arguments 2 and 3 depending on which type of test is requested
-	var num_test_updates int
-	var message_rate int
-	var test_duration_seconds int
-	arg2_i64, parseErr := strconv.ParseInt(flag.Args()[1], 0, 0)
+	var numTestUpdates int
+	var messageRate int
+	var testDurationSeconds int
+	var peerIP string
+	arg2_i64, parseErr := strconv.ParseInt(flag.Arg(1), 0, 0)
 	if parseErr != nil {
 		panic(fmt.Errorf("failed to parse argument 2 as an int: %w", parseErr))
 	}
 	if strings.EqualFold(*testType, "throughput") {
-		num_test_updates = int(arg2_i64)
+		numTestUpdates = int(arg2_i64)
+		peerIP = flag.Arg(2)
 	} else if strings.EqualFold(*testType, "latency") {
-		message_rate = int(arg2_i64)
-		duration_i64, parseErr := strconv.ParseInt(flag.Args()[2], 0, 0)
+		messageRate = int(arg2_i64)
+		duration_i64, parseErr := strconv.ParseInt(flag.Arg(2), 0, 0)
 		if parseErr != nil {
 			panic(fmt.Errorf("failed to parse argument 3 as an int: %w", parseErr))
 		}
-		test_duration_seconds = int(duration_i64)
+		testDurationSeconds = int(duration_i64)
+		peerIP = flag.Arg(3)
 	}
 
-	// The gRPC client connection should be shared by all Gateway connections to this endpoint
-	clientConnection := newGrpcConnection()
-	defer clientConnection.Close()
-
-	id := newIdentity()
-	sign := newSign()
+	testClient := TestClient{
+		cryptoPath:      path.Join(*cryptoDir, orgCryptoPath),
+		certPath:        path.Join(*cryptoDir, orgCryptoPath, userCertsSuffix),
+		keyPath:         path.Join(*cryptoDir, orgCryptoPath, userKeysSuffix),
+		tlsCertPath:     path.Join(*cryptoDir, orgCryptoPath, tlsCertSuffix),
+		peerEndpoint:    "dns:///" + peerIP + ":7051",
+		workloadObjects: generateWorkload(workloadSize, testDataSize)}
+	defer testClient.Close()
+	// Initialize the GRPC connection and the client's identity functions
+	testClient.newGrpcConnection()
+	id := testClient.newIdentity()
+	sign := testClient.newSign()
 
 	// Create a Gateway connection for a specific client identity
 	gw, err := client.Connect(
 		id,
 		client.WithSign(sign),
-		client.WithClientConnection(clientConnection),
+		client.WithClientConnection(testClient.clientConnection),
 		// Default timeouts for different gRPC calls
 		client.WithEvaluateTimeout(5*time.Second),
 		client.WithEndorseTimeout(15*time.Second),
@@ -105,78 +138,75 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	defer gw.Close()
+	testClient.gateway = gw
+	// Initialize the client Contract object for the test's channel and chaincode
+	testClient.contract = testClient.gateway.GetNetwork(*channelName).GetContract(*chaincodeName)
 
-	network := gw.GetNetwork(channelName)
-	contract := network.GetContract(chaincodeName)
-
-	const workload_size = 1024
-	workloadObjects := generateWorkload(workload_size, test_data_size)
 	if strings.EqualFold(*testType, "throughput") {
-		throughputTest(workloadObjects, contract, num_test_updates)
+		testClient.ThroughputTest(numTestUpdates)
 	} else if strings.EqualFold(*testType, "latency") {
-		latencyTest(workloadObjects, contract, message_rate, time.Duration(test_duration_seconds)*time.Second)
+		testClient.LatencyTest(messageRate, time.Duration(testDurationSeconds)*time.Second)
 	}
 }
 
-func throughputTest(workloadObjects map[string][]byte, contract *client.Contract, num_test_updates int) {
-	putCommitChannel := make(chan *client.Commit, num_test_updates)
+func (tc *TestClient) ThroughputTest(numTestUpdates int) {
+	putCommitChannel := make(chan *client.Commit, numTestUpdates)
 	doneChannel := make(chan bool)
-	sendTimes := make([]time.Time, num_test_updates)
-	commitTimes := make([]time.Time, num_test_updates)
+	tc.sendTimes = make([]time.Time, numTestUpdates)
+	tc.commitTimes = make([]time.Time, numTestUpdates)
 	// Start a thread to receive commit pointers from the SubmitAsync calls and wait on them
-	go collectStatusesFixed(putCommitChannel, commitTimes, doneChannel)
+	go collectStatusesFixed(putCommitChannel, tc.commitTimes, doneChannel)
 	// Send a bunch of put updates, each targeting a random key, with the test data
 	// Measure the total time taken and divide by the total number of bytes sent to get the throughput
 	beginTime := time.Now()
-	for i := range num_test_updates {
-		testObjectKey := fmt.Sprintf("testKey_%d", rand.Intn(len(workloadObjects)))
-		sendTimes[i] = time.Now()
-		putCommitChannel <- putStringAsync(contract, testObjectKey, workloadObjects[testObjectKey])
+	for i := range numTestUpdates {
+		testObjectKey := fmt.Sprintf("testKey_%d", rand.Intn(len(tc.workloadObjects)))
+		tc.sendTimes[i] = time.Now()
+		putCommitChannel <- putStringAsync(tc.contract, testObjectKey, tc.workloadObjects[testObjectKey])
 	}
 	// Wait for the collectStatuses thread to finish
 	<-doneChannel
 	endTime := time.Now()
 	totalDuration := endTime.Sub(beginTime)
-	throughputBps := float64(len(workloadObjects["testKey_0"])*num_test_updates) / totalDuration.Seconds()
-	throughputOps := float64(num_test_updates) / totalDuration.Seconds()
+	throughputBps := float64(len(tc.workloadObjects["testKey_0"])*numTestUpdates) / totalDuration.Seconds()
+	throughputOps := float64(numTestUpdates) / totalDuration.Seconds()
 	fmt.Printf("Duration: %v\nThroughput: %v bytes/sec (%v KB/s)\nOperations: %v ops\n",
 		totalDuration, throughputBps, (throughputBps / 1024), throughputOps)
-	saveTimestampFile(sendTimes, commitTimes)
+	tc.saveTimestampFile()
 }
 
-func latencyTest(workloadObjects map[string][]byte, contract *client.Contract, messages_per_second int, test_duration time.Duration) {
-	putCommitChannel := make(chan *client.Commit, messages_per_second*int(test_duration.Seconds()))
+func (tc *TestClient) LatencyTest(messagesPerSecond int, testDuration time.Duration) {
+	putCommitChannel := make(chan *client.Commit, messagesPerSecond*int(testDuration.Seconds()))
 	doneChannel := make(chan bool)
 	lastMessageChannel := make(chan int)
-	sendTimes := make([]time.Time, 0, messages_per_second*int(test_duration.Seconds()))
-	commitTimes := make([]time.Time, 0, messages_per_second*int(test_duration.Seconds()))
-	loopInterval := time.Second / time.Duration(messages_per_second)
+	tc.sendTimes = make([]time.Time, 0, messagesPerSecond*int(testDuration.Seconds()))
+	tc.commitTimes = make([]time.Time, 0, messagesPerSecond*int(testDuration.Seconds()))
+	loopInterval := time.Second / time.Duration(messagesPerSecond)
 	// Debugging: Check my time math
-	slog.Debug(fmt.Sprintf("Test duration %v, sending %v messages per second, so loop interval is %v", test_duration, messages_per_second, loopInterval))
+	slog.Debug(fmt.Sprintf("Test duration %v, sending %v messages per second, so loop interval is %v", testDuration, messagesPerSecond, loopInterval))
 	// Start a thread to receive commit pointers from the SubmitAsync calls and wait on them
-	go collectStatusesFlexible(putCommitChannel, commitTimes, lastMessageChannel, doneChannel)
+	go collectStatusesFlexible(putCommitChannel, tc.commitTimes, lastMessageChannel, doneChannel)
 	messageCounter := 0
 	// Loop for the requested test duration
-	endTime := time.Now().Add(test_duration)
+	endTime := time.Now().Add(testDuration)
 	lastSentTime := time.Now()
 	for time.Now().Before(endTime) {
-		testObjectKey := fmt.Sprintf("testKey_%d", rand.Intn(len(workloadObjects)))
+		testObjectKey := fmt.Sprintf("testKey_%d", rand.Intn(len(tc.workloadObjects)))
 		waitTime := time.Until(lastSentTime.Add(loopInterval))
 		if waitTime < 0 {
 			slog.Warn("Send interval time has already elapsed, not sending at requested rate!")
 		}
 		time.Sleep(waitTime)
 		lastSentTime = time.Now()
-		sendTimes = append(sendTimes, lastSentTime)
-		putCommitChannel <- putStringAsync(contract, testObjectKey, workloadObjects[testObjectKey])
+		tc.sendTimes = append(tc.sendTimes, lastSentTime)
+		putCommitChannel <- putStringAsync(tc.contract, testObjectKey, tc.workloadObjects[testObjectKey])
 		messageCounter++
 	}
 	// Tell the collect-statuses thread what the last message number is
 	lastMessageChannel <- messageCounter
 	// Wait for it to be done
 	<-doneChannel
-	saveTimestampFile(sendTimes, commitTimes)
+	tc.saveTimestampFile()
 }
 
 func collectStatusesFixed(commitChannel <-chan *client.Commit, commitTimes []time.Time, done chan<- bool) {
@@ -226,58 +256,34 @@ func collectStatusesFlexible(commitChannel <-chan *client.Commit, commitTimes []
 	done <- true
 }
 
-func saveTimestampFile(sendTimes []time.Time, commitTimes []time.Time) {
+func (tc *TestClient) saveTimestampFile() {
 	const TLT_READY_TO_SEND = 11000
 	const TLT_EC_SIGNATURE_NOTIFY = 12002
-	f, err := os.Create("timestamp.log")
+	f, err := os.Create(timestampFileName)
 	if err != nil {
-		panic(fmt.Errorf("could not open timestamp.log file for writing: %w", err))
+		panic(fmt.Errorf("could not open %v file for writing: %w", timestampFileName, err))
 	}
 	defer f.Close()
 	fileWriter := bufio.NewWriter(f)
-	for i := range len(sendTimes) {
-		fileWriter.WriteString(fmt.Sprintf("%d %d %d\n", TLT_READY_TO_SEND, i, sendTimes[i].UnixNano()))
+	for i := range len(tc.sendTimes) {
+		fileWriter.WriteString(fmt.Sprintf("%d %d %d\n", TLT_READY_TO_SEND, i, tc.sendTimes[i].UnixNano()))
 	}
-	for i := range len(commitTimes) {
-		fileWriter.WriteString(fmt.Sprintf("%d %d %d\n", TLT_EC_SIGNATURE_NOTIFY, i, commitTimes[i].UnixNano()))
+	for i := range len(tc.commitTimes) {
+		fileWriter.WriteString(fmt.Sprintf("%d %d %d\n", TLT_EC_SIGNATURE_NOTIFY, i, tc.commitTimes[i].UnixNano()))
 	}
 	fileWriter.Flush()
 }
 
-func generateWorkload(numObjects int, size int) map[string][]byte {
-	workloadMap := make(map[string][]byte)
-	for i := range numObjects {
-		workloadMap[fmt.Sprintf("testKey_%d", i)] = generateRandomStringBytes(size)
-	}
-	return workloadMap
+func (tc *TestClient) Close() {
+	tc.clientConnection.Close()
+	tc.gateway.Close()
 }
 
-// Generates a random string, but stores it in a byte array instead of a string
-func generateRandomStringBytes(length int) []byte {
-	const letters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890"
-	stringBytes := make([]byte, length)
-	for i := 0; i < length; i++ {
-		stringBytes[i] = letters[rand.Intn(len(letters))]
-	}
-	return stringBytes
-}
-
-// Generates a random alphanumeric string
-func generateRandomString(length int) string {
-	const letters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890"
-	stringBuilder := strings.Builder{}
-	stringBuilder.Grow(length)
-	for i := 0; i < length; i++ {
-		stringBuilder.WriteByte(letters[rand.Intn(len(letters))])
-	}
-	return stringBuilder.String()
-}
-
-// newGrpcConnection creates a gRPC connection to the Gateway server.
-func newGrpcConnection() *grpc.ClientConn {
-	certificatePEM, err := os.ReadFile(tlsCertPath)
+// creates a gRPC connection to the Gateway server
+func (tc *TestClient) newGrpcConnection() {
+	certificatePEM, err := os.ReadFile(tc.tlsCertPath)
 	if err != nil {
-		panic(fmt.Errorf("failed to read TLS certifcate file: %w", err))
+		panic(fmt.Errorf("failed to read TLS certificate file: %w", err))
 	}
 
 	certificate, err := identity.CertificateFromPEM(certificatePEM)
@@ -289,17 +295,17 @@ func newGrpcConnection() *grpc.ClientConn {
 	certPool.AddCert(certificate)
 	transportCredentials := credentials.NewClientTLSFromCert(certPool, gatewayPeer)
 
-	connection, err := grpc.NewClient(peerEndpoint, grpc.WithTransportCredentials(transportCredentials))
+	connection, err := grpc.NewClient(tc.peerEndpoint, grpc.WithTransportCredentials(transportCredentials))
 	if err != nil {
 		panic(fmt.Errorf("failed to create gRPC connection: %w", err))
 	}
 
-	return connection
+	tc.clientConnection = connection
 }
 
 // newIdentity creates a client identity for this Gateway connection using an X.509 certificate.
-func newIdentity() *identity.X509Identity {
-	certificatePEM, err := readFirstFile(certPath)
+func (tc *TestClient) newIdentity() *identity.X509Identity {
+	certificatePEM, err := readFirstFile(tc.certPath)
 	if err != nil {
 		panic(fmt.Errorf("failed to read certificate file: %w", err))
 	}
@@ -318,8 +324,8 @@ func newIdentity() *identity.X509Identity {
 }
 
 // newSign creates a function that generates a digital signature from a message digest using a private key.
-func newSign() identity.Sign {
-	privateKeyPEM, err := readFirstFile(keyPath)
+func (tc *TestClient) newSign() identity.Sign {
+	privateKeyPEM, err := readFirstFile(tc.keyPath)
 	if err != nil {
 		panic(fmt.Errorf("failed to read private key file: %w", err))
 	}
@@ -425,4 +431,35 @@ func printErrorDetails(err error) {
 			}
 		}
 	}
+}
+
+// Generates a collection of random key-value pairs, where the keys are all in the format testKey_N
+// and the values are all strings (as byte arrays) of the same fixed size
+func generateWorkload(numObjects int, size int) map[string][]byte {
+	workloadMap := make(map[string][]byte)
+	for i := range numObjects {
+		workloadMap[fmt.Sprintf("testKey_%d", i)] = generateRandomStringBytes(size)
+	}
+	return workloadMap
+}
+
+// Generates a random string, but stores it in a byte array instead of a string
+func generateRandomStringBytes(length int) []byte {
+	const letters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890"
+	stringBytes := make([]byte, length)
+	for i := 0; i < length; i++ {
+		stringBytes[i] = letters[rand.Intn(len(letters))]
+	}
+	return stringBytes
+}
+
+// Generates a random alphanumeric string
+func generateRandomString(length int) string {
+	const letters = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ1234567890"
+	stringBuilder := strings.Builder{}
+	stringBuilder.Grow(length)
+	for i := 0; i < length; i++ {
+		stringBuilder.WriteByte(letters[rand.Intn(len(letters))])
+	}
+	return stringBuilder.String()
 }
