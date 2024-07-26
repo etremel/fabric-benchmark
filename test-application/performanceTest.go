@@ -194,7 +194,7 @@ func (tc *TestClient) LatencyTest(messagesPerSecond int, testDuration time.Durat
 		testObjectKey := fmt.Sprintf("testKey_%d", rand.Intn(len(tc.workloadObjects)))
 		waitTime := time.Until(lastSentTime.Add(loopInterval))
 		if waitTime < 0 {
-			slog.Warn("Send interval time has already elapsed, not sending at requested rate!")
+			slog.Warn("Send interval time has already elapsed, sending slower than the requested rate!")
 		}
 		time.Sleep(waitTime)
 		lastSentTime = time.Now()
@@ -202,9 +202,11 @@ func (tc *TestClient) LatencyTest(messagesPerSecond int, testDuration time.Durat
 		putCommitChannel <- putStringAsync(tc.contract, testObjectKey, tc.workloadObjects[testObjectKey])
 		messageCounter++
 	}
+	slog.Debug(fmt.Sprintf("All messages sent, last counter value was %v", messageCounter-1))
 	// Tell the collect-statuses thread what the last message number is
-	lastMessageChannel <- messageCounter
+	lastMessageChannel <- messageCounter - 1
 	// Wait for it to be done
+	slog.Debug("Waiting for collect-statuses thread to finish")
 	<-doneChannel
 	tc.saveTimestampFile()
 }
