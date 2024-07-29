@@ -4,11 +4,13 @@ import (
 	"bufio"
 	"context"
 	"crypto/x509"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
 	"math/rand"
+	"net"
 	"os"
 	"path"
 	"strconv"
@@ -34,6 +36,7 @@ const (
 	gatewayPeer          = "peer0.org1.example.com"
 	workloadSize         = 1024
 	timestampFileName    = "timestamp.log"
+	passiveClientPort    = "33333"
 )
 
 type TestClient struct {
@@ -50,6 +53,15 @@ type TestClient struct {
 	contract         *client.Contract
 }
 
+type PassiveStartMessage struct {
+	TestType     string
+	DataSize     int
+	MessageRate  int
+	TestDuration int
+	NumMessages  int
+	StartTime    time.Time
+}
+
 func main() {
 	verbose := flag.Bool("v", false, "Verbose mode")
 	testType := flag.String("testType", "throughput", "Type of test to run (throughput or latency)")
@@ -63,61 +75,82 @@ func main() {
 	cryptoDir := flag.String("c", path.Join(fabricConfDir, "crypto-config"), "Root directory of the certificates directory")
 	chaincodeName := flag.String("chaincode", defaultChaincodeName, "Name of the chaincode to invoke transactions on for testing")
 	channelName := flag.String("channel", defaultChannelName, "Name of the channel the test organizations have joined")
+	activeClientIP := flag.String("passive", "", "Sets this test client to passive mode; argument is the IP of the active client that will start the test")
 	flag.Parse()
 	if *verbose {
 		slog.SetLogLoggerLevel(slog.LevelDebug)
 	} else {
 		slog.SetLogLoggerLevel(slog.LevelInfo)
 	}
+	var isActiveClient bool
+	if *activeClientIP == "" {
+		isActiveClient = true
+	} else {
+		isActiveClient = false
+	}
 	if !(strings.EqualFold(*testType, "throughput") || strings.EqualFold(*testType, "latency")) {
 		fmt.Println("Unknown test type: " + *testType)
 		return
 	}
-	if strings.EqualFold(*testType, "throughput") && len(flag.Args()) < 3 {
+	if isActiveClient && strings.EqualFold(*testType, "throughput") && len(flag.Args()) < 3 {
 		fmt.Println("Error: Missing required arguments")
-		fmt.Printf("Usage: %s --testType throughput <data size> <num messages> <peer IP>\n", os.Args[0])
+		fmt.Printf("Usage: %s --testType throughput <data size> <num messages> <peer IP> [<client IPs>]\n", os.Args[0])
 		return
 	}
-	if strings.EqualFold(*testType, "latency") && len(flag.Args()) < 4 {
+	if isActiveClient && strings.EqualFold(*testType, "latency") && len(flag.Args()) < 4 {
 		fmt.Println("Error: Missing required arguments")
-		fmt.Printf("Usage: %s --testType latency <data size> <message rate> <test duration> <peer IP>\n", os.Args[0])
+		fmt.Printf("Usage: %s --testType latency <data size> <message rate> <test duration> <peer IP> [<client IPs>]\n", os.Args[0])
 		return
 	}
-	dataSize_i64, parseErr := strconv.ParseInt(flag.Arg(0), 0, 0)
-	if parseErr != nil {
-		panic(fmt.Errorf("failed to parse argument 1 as an int: %w", parseErr))
+	// A passive client only needs the peer IP argument; it will receive the test parameters from the leader (active) client
+	if !isActiveClient && len(flag.Args()) < 1 {
+		fmt.Println(("Error: Missing requrired argument"))
+		fmt.Printf("Usage: %s --passive <leader IP> <peer IP>", os.Args[0])
+		return
 	}
-	// Annoyingly, ParseInt always returns an int64, which must be cast to the correct type
-	testDataSize := int(dataSize_i64)
-	// Parse arguments 2 and 3 depending on which type of test is requested
 	var numTestUpdates int
 	var messageRate int
+	var testDataSize int
 	var testDurationSeconds int
 	var peerIP string
-	arg2_i64, parseErr := strconv.ParseInt(flag.Arg(1), 0, 0)
-	if parseErr != nil {
-		panic(fmt.Errorf("failed to parse argument 2 as an int: %w", parseErr))
-	}
-	if strings.EqualFold(*testType, "throughput") {
-		numTestUpdates = int(arg2_i64)
-		peerIP = flag.Arg(2)
-	} else if strings.EqualFold(*testType, "latency") {
-		messageRate = int(arg2_i64)
-		duration_i64, parseErr := strconv.ParseInt(flag.Arg(2), 0, 0)
+	var passiveClientIPs []string
+	if !isActiveClient {
+		peerIP = flag.Arg(0)
+	} else {
+		// Parse the other positional arguments only for the active client
+		dataSize_i64, parseErr := strconv.ParseInt(flag.Arg(0), 0, 0)
 		if parseErr != nil {
-			panic(fmt.Errorf("failed to parse argument 3 as an int: %w", parseErr))
+			panic(fmt.Errorf("failed to parse argument 1 as an int: %w", parseErr))
 		}
-		testDurationSeconds = int(duration_i64)
-		peerIP = flag.Arg(3)
+		// Annoyingly, ParseInt always returns an int64, which must be cast to the correct type
+		testDataSize = int(dataSize_i64)
+		// Parse positional arguments depending on which type of test is requested
+		arg2_i64, parseErr := strconv.ParseInt(flag.Arg(1), 0, 0)
+		if parseErr != nil {
+			panic(fmt.Errorf("failed to parse argument 2 as an int: %w", parseErr))
+		}
+		if strings.EqualFold(*testType, "throughput") {
+			numTestUpdates = int(arg2_i64)
+			peerIP = flag.Arg(2)
+			passiveClientIPs = flag.Args()[3:]
+		} else if strings.EqualFold(*testType, "latency") {
+			messageRate = int(arg2_i64)
+			duration_i64, parseErr := strconv.ParseInt(flag.Arg(2), 0, 0)
+			if parseErr != nil {
+				panic(fmt.Errorf("failed to parse argument 3 as an int: %w", parseErr))
+			}
+			testDurationSeconds = int(duration_i64)
+			peerIP = flag.Arg(3)
+			passiveClientIPs = flag.Args()[4:]
+		}
 	}
 
 	testClient := TestClient{
-		cryptoPath:      path.Join(*cryptoDir, orgCryptoPath),
-		certPath:        path.Join(*cryptoDir, orgCryptoPath, userCertsSuffix),
-		keyPath:         path.Join(*cryptoDir, orgCryptoPath, userKeysSuffix),
-		tlsCertPath:     path.Join(*cryptoDir, orgCryptoPath, tlsCertSuffix),
-		peerEndpoint:    "dns:///" + peerIP + ":7051",
-		workloadObjects: generateWorkload(workloadSize, testDataSize)}
+		cryptoPath:   path.Join(*cryptoDir, orgCryptoPath),
+		certPath:     path.Join(*cryptoDir, orgCryptoPath, userCertsSuffix),
+		keyPath:      path.Join(*cryptoDir, orgCryptoPath, userKeysSuffix),
+		tlsCertPath:  path.Join(*cryptoDir, orgCryptoPath, tlsCertSuffix),
+		peerEndpoint: "dns:///" + peerIP + ":7051"}
 	defer testClient.Close()
 	// Initialize the GRPC connection and the client's identity functions
 	testClient.newGrpcConnection()
@@ -141,12 +174,69 @@ func main() {
 	testClient.gateway = gw
 	// Initialize the client Contract object for the test's channel and chaincode
 	testClient.contract = testClient.gateway.GetNetwork(*channelName).GetContract(*chaincodeName)
-
-	if strings.EqualFold(*testType, "throughput") {
-		testClient.ThroughputTest(numTestUpdates)
-	} else if strings.EqualFold(*testType, "latency") {
-		testClient.LatencyTest(messageRate, time.Duration(testDurationSeconds)*time.Second)
+	// If this is the active client, decide on a start time and send launch messages to the passive clients
+	// If this is a passive client, start listening for a message from the active client
+	if isActiveClient {
+		testClient.workloadObjects = generateWorkload(workloadSize, testDataSize)
+		passiveClientWriters := make([]*json.Encoder, 0, len(passiveClientIPs))
+		for _, ip := range passiveClientIPs {
+			passiveConn, error := net.Dial("tcp", net.JoinHostPort(ip, passiveClientPort))
+			if error != nil {
+				panic(fmt.Errorf("failed to connect to passive client at %v due to error %w", ip, error))
+			}
+			passiveClientWriters = append(passiveClientWriters, json.NewEncoder(passiveConn))
+			defer passiveConn.Close()
+		}
+		startMessage := PassiveStartMessage{
+			TestType:     *testType,
+			DataSize:     testDataSize,
+			MessageRate:  messageRate,
+			NumMessages:  numTestUpdates,
+			TestDuration: testDurationSeconds,
+			StartTime:    time.Now().Add(time.Duration(10) * time.Second)}
+		slog.Debug(fmt.Sprintf("Sending message to passive clients %v: %+v", passiveClientIPs, startMessage))
+		for i, writer := range passiveClientWriters {
+			err := writer.Encode(startMessage)
+			if err != nil {
+				panic(fmt.Errorf("failed to send the JSON message to client %v due to error %w", i, err))
+			}
+		}
+		slog.Debug("Waiting until start time")
+		time.Sleep(time.Until(startMessage.StartTime))
+		slog.Debug("Starting test on active client")
+		if strings.EqualFold(*testType, "throughput") {
+			testClient.ThroughputTest(numTestUpdates)
+		} else if strings.EqualFold(*testType, "latency") {
+			testClient.LatencyTest(messageRate, time.Duration(testDurationSeconds)*time.Second)
+		}
+	} else {
+		listener, err := net.Listen("tcp", ":"+passiveClientPort)
+		if err != nil {
+			panic(fmt.Errorf("passive client failed to listen on port %v: %w", passiveClientPort, err))
+		}
+		defer listener.Close()
+		activeConn, err := listener.Accept()
+		if err != nil {
+			panic(fmt.Errorf("passive client failed to accept a connection due to error: %w", err))
+		}
+		defer activeConn.Close()
+		jsonReader := json.NewDecoder(activeConn)
+		var startMessage PassiveStartMessage
+		err = jsonReader.Decode(&startMessage)
+		if err != nil {
+			panic(fmt.Errorf("passive client failed to read a JSON message from the socket, error was: %w", err))
+		}
+		testClient.workloadObjects = generateWorkload(workloadSize, startMessage.DataSize)
+		slog.Debug("Passive client got a start message, waiting until the start time")
+		time.Sleep(time.Until(startMessage.StartTime))
+		slog.Debug("Starting test on passive client")
+		if strings.EqualFold(startMessage.TestType, "throughput") {
+			testClient.ThroughputTest(startMessage.NumMessages)
+		} else if strings.EqualFold(*testType, "latency") {
+			testClient.LatencyTest(messageRate, time.Duration(startMessage.TestDuration)*time.Second)
+		}
 	}
+
 }
 
 func (tc *TestClient) ThroughputTest(numTestUpdates int) {
