@@ -30,20 +30,19 @@ const (
 	orgCryptoPath        = "peerOrganizations/org1.example.com"
 	userCertsSuffix      = "users/User1@org1.example.com/msp/signcerts"
 	userKeysSuffix       = "users/User1@org1.example.com/msp/keystore"
-	tlsCertSuffix        = "peers/peer0.org1.example.com/tls/ca.crt"
 	defaultChaincodeName = "plain_string"
 	defaultChannelName   = "mychannel"
-	gatewayPeer          = "peer0.org1.example.com"
+	defaultGatewayPeer   = "peer0.org1.example.com"
 	workloadSize         = 1024
 	timestampFileName    = "timestamp.log"
 	passiveClientPort    = "33333"
 )
 
 type TestClient struct {
-	cryptoPath       string
-	certPath         string
-	keyPath          string
-	tlsCertPath      string
+	userCertPath     string
+	userKeyPath      string
+	peerTlsCertPath  string
+	peerName         string
 	peerEndpoint     string
 	workloadObjects  map[string][]byte
 	sendTimes        []time.Time
@@ -76,6 +75,7 @@ func main() {
 	chaincodeName := flag.String("chaincode", defaultChaincodeName, "Name of the chaincode to invoke transactions on for testing")
 	channelName := flag.String("channel", defaultChannelName, "Name of the channel the test organizations have joined")
 	activeClientIP := flag.String("passive", "", "Sets this test client to passive mode; argument is the IP of the active client that will start the test")
+	gatewayPeerName := flag.String("peerName", defaultGatewayPeer, "(Host) name of the peer to connect to as the gateway")
 	flag.Parse()
 	if *verbose {
 		slog.SetLogLoggerLevel(slog.LevelDebug)
@@ -145,12 +145,13 @@ func main() {
 		}
 	}
 
+	// Use the peer's hostname to build the path to its TLS certificate: certificates for each possible gateway peer are stored in peers/<hostname>/tls/ca.crt
 	testClient := TestClient{
-		cryptoPath:   path.Join(*cryptoDir, orgCryptoPath),
-		certPath:     path.Join(*cryptoDir, orgCryptoPath, userCertsSuffix),
-		keyPath:      path.Join(*cryptoDir, orgCryptoPath, userKeysSuffix),
-		tlsCertPath:  path.Join(*cryptoDir, orgCryptoPath, tlsCertSuffix),
-		peerEndpoint: "dns:///" + peerIP + ":7051"}
+		userCertPath:    path.Join(*cryptoDir, orgCryptoPath, userCertsSuffix),
+		userKeyPath:     path.Join(*cryptoDir, orgCryptoPath, userKeysSuffix),
+		peerName:        *gatewayPeerName,
+		peerTlsCertPath: path.Join(*cryptoDir, orgCryptoPath, "peers", *gatewayPeerName, "tls", "ca.crt"),
+		peerEndpoint:    "dns:///" + peerIP + ":7051"}
 	defer testClient.Close()
 	// Initialize the GRPC connection and the client's identity functions
 	testClient.newGrpcConnection()
@@ -193,7 +194,7 @@ func main() {
 			MessageRate:  messageRate,
 			NumMessages:  numTestUpdates,
 			TestDuration: testDurationSeconds,
-			StartTime:    time.Now().Add(time.Duration(10) * time.Second)}
+			StartTime:    time.Now().Add(time.Duration(5) * time.Second)}
 		slog.Debug(fmt.Sprintf("Sending message to passive clients %v: %+v", passiveClientIPs, startMessage))
 		for i, writer := range passiveClientWriters {
 			err := writer.Encode(startMessage)
@@ -227,13 +228,13 @@ func main() {
 			panic(fmt.Errorf("passive client failed to read a JSON message from the socket, error was: %w", err))
 		}
 		testClient.workloadObjects = generateWorkload(workloadSize, startMessage.DataSize)
-		slog.Debug("Passive client got a start message, waiting until the start time")
+		slog.Debug(fmt.Sprintf("Passive client got a start message: %v. Waiting until the start time", startMessage))
 		time.Sleep(time.Until(startMessage.StartTime))
 		slog.Debug("Starting test on passive client")
 		if strings.EqualFold(startMessage.TestType, "throughput") {
 			testClient.ThroughputTest(startMessage.NumMessages)
 		} else if strings.EqualFold(*testType, "latency") {
-			testClient.LatencyTest(messageRate, time.Duration(startMessage.TestDuration)*time.Second)
+			testClient.LatencyTest(startMessage.MessageRate, time.Duration(startMessage.TestDuration)*time.Second)
 		}
 	}
 
@@ -373,7 +374,7 @@ func (tc *TestClient) Close() {
 
 // creates a gRPC connection to the Gateway server
 func (tc *TestClient) newGrpcConnection() {
-	certificatePEM, err := os.ReadFile(tc.tlsCertPath)
+	certificatePEM, err := os.ReadFile(tc.peerTlsCertPath)
 	if err != nil {
 		panic(fmt.Errorf("failed to read TLS certificate file: %w", err))
 	}
@@ -385,7 +386,7 @@ func (tc *TestClient) newGrpcConnection() {
 
 	certPool := x509.NewCertPool()
 	certPool.AddCert(certificate)
-	transportCredentials := credentials.NewClientTLSFromCert(certPool, gatewayPeer)
+	transportCredentials := credentials.NewClientTLSFromCert(certPool, tc.peerName)
 
 	connection, err := grpc.NewClient(tc.peerEndpoint, grpc.WithTransportCredentials(transportCredentials))
 	if err != nil {
@@ -397,7 +398,7 @@ func (tc *TestClient) newGrpcConnection() {
 
 // newIdentity creates a client identity for this Gateway connection using an X.509 certificate.
 func (tc *TestClient) newIdentity() *identity.X509Identity {
-	certificatePEM, err := readFirstFile(tc.certPath)
+	certificatePEM, err := readFirstFile(tc.userCertPath)
 	if err != nil {
 		panic(fmt.Errorf("failed to read certificate file: %w", err))
 	}
@@ -417,7 +418,7 @@ func (tc *TestClient) newIdentity() *identity.X509Identity {
 
 // newSign creates a function that generates a digital signature from a message digest using a private key.
 func (tc *TestClient) newSign() identity.Sign {
-	privateKeyPEM, err := readFirstFile(tc.keyPath)
+	privateKeyPEM, err := readFirstFile(tc.userKeyPath)
 	if err != nil {
 		panic(fmt.Errorf("failed to read private key file: %w", err))
 	}
