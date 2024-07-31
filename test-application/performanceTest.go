@@ -36,6 +36,7 @@ const (
 	workloadSize         = 1024
 	timestampFileName    = "timestamp.log"
 	passiveClientPort    = "33333"
+	passiveClientDelay   = time.Duration(5) * time.Second
 )
 
 type TestClient struct {
@@ -104,7 +105,7 @@ func main() {
 	}
 	// A passive client only needs the peer IP argument; it will receive the test parameters from the leader (active) client
 	if !isActiveClient && len(flag.Args()) < 1 {
-		fmt.Println(("Error: Missing requrired argument"))
+		fmt.Println(("Error: Missing required argument"))
 		fmt.Printf("Usage: %s --passive <leader IP> <peer IP>", os.Args[0])
 		return
 	}
@@ -175,10 +176,10 @@ func main() {
 	testClient.gateway = gw
 	// Initialize the client Contract object for the test's channel and chaincode
 	testClient.contract = testClient.gateway.GetNetwork(*channelName).GetContract(*chaincodeName)
-	// If this is the active client, decide on a start time and send launch messages to the passive clients
+	// If this is the active client, create and send launch messages to the passive clients
 	// If this is a passive client, start listening for a message from the active client
+	var startMessage PassiveStartMessage
 	if isActiveClient {
-		testClient.workloadObjects = generateWorkload(workloadSize, testDataSize)
 		passiveClientWriters := make([]*json.Encoder, 0, len(passiveClientIPs))
 		for _, ip := range passiveClientIPs {
 			passiveConn, error := net.Dial("tcp", net.JoinHostPort(ip, passiveClientPort))
@@ -188,27 +189,20 @@ func main() {
 			passiveClientWriters = append(passiveClientWriters, json.NewEncoder(passiveConn))
 			defer passiveConn.Close()
 		}
-		startMessage := PassiveStartMessage{
+		// Tell each client to send at a rate of 1/(number of clients) so the aggregate rate is the requested rate
+		startMessage = PassiveStartMessage{
 			TestType:     *testType,
 			DataSize:     testDataSize,
-			MessageRate:  messageRate,
+			MessageRate:  messageRate / (len(passiveClientIPs) + 1),
 			NumMessages:  numTestUpdates,
 			TestDuration: testDurationSeconds,
-			StartTime:    time.Now().Add(time.Duration(5) * time.Second)}
+			StartTime:    time.Now().Add(passiveClientDelay)}
 		slog.Debug(fmt.Sprintf("Sending message to passive clients %v: %+v", passiveClientIPs, startMessage))
 		for i, writer := range passiveClientWriters {
 			err := writer.Encode(startMessage)
 			if err != nil {
 				panic(fmt.Errorf("failed to send the JSON message to client %v due to error %w", i, err))
 			}
-		}
-		slog.Debug("Waiting until start time")
-		time.Sleep(time.Until(startMessage.StartTime))
-		slog.Debug("Starting test on active client")
-		if strings.EqualFold(*testType, "throughput") {
-			testClient.ThroughputTest(numTestUpdates)
-		} else if strings.EqualFold(*testType, "latency") {
-			testClient.LatencyTest(messageRate, time.Duration(testDurationSeconds)*time.Second)
 		}
 	} else {
 		listener, err := net.Listen("tcp", ":"+passiveClientPort)
@@ -222,25 +216,26 @@ func main() {
 		}
 		defer activeConn.Close()
 		jsonReader := json.NewDecoder(activeConn)
-		var startMessage PassiveStartMessage
 		err = jsonReader.Decode(&startMessage)
 		if err != nil {
 			panic(fmt.Errorf("passive client failed to read a JSON message from the socket, error was: %w", err))
 		}
-		testClient.workloadObjects = generateWorkload(workloadSize, startMessage.DataSize)
-		slog.Debug(fmt.Sprintf("Passive client got a start message: %v. Waiting until the start time", startMessage))
-		time.Sleep(time.Until(startMessage.StartTime))
-		slog.Debug("Starting test on passive client")
-		if strings.EqualFold(startMessage.TestType, "throughput") {
-			testClient.ThroughputTest(startMessage.NumMessages)
-		} else if strings.EqualFold(*testType, "latency") {
-			testClient.LatencyTest(startMessage.MessageRate, time.Duration(startMessage.TestDuration)*time.Second)
-		}
+		slog.Debug(fmt.Sprintf("Passive client got a start message: %v.", startMessage))
 	}
-
+	// For both types of client, startMessage now contains all the parameters, so use them to start the test
+	slog.Debug("Generating workload")
+	testClient.workloadObjects = generateWorkload(workloadSize, startMessage.DataSize)
+	slog.Debug("Waiting until start time...")
+	time.Sleep(time.Until(startMessage.StartTime))
+	if strings.EqualFold(startMessage.TestType, "throughput") {
+		testClient.ThroughputTest(startMessage.NumMessages)
+	} else if strings.EqualFold(startMessage.TestType, "latency") {
+		testClient.LatencyTest(startMessage.MessageRate, time.Duration(startMessage.TestDuration)*time.Second)
+	}
 }
 
 func (tc *TestClient) ThroughputTest(numTestUpdates int) {
+	slog.Debug(fmt.Sprintf("Starting ThroughputTest with %v updates", numTestUpdates))
 	putCommitChannel := make(chan *client.Commit, numTestUpdates)
 	doneChannel := make(chan bool)
 	tc.sendTimes = make([]time.Time, numTestUpdates)
@@ -267,6 +262,7 @@ func (tc *TestClient) ThroughputTest(numTestUpdates int) {
 }
 
 func (tc *TestClient) LatencyTest(messagesPerSecond int, testDuration time.Duration) {
+	slog.Debug(fmt.Sprintf("Starting LatencyTest with messagesPerSecond = %v, duration = %v", messagesPerSecond, testDuration))
 	putCommitChannel := make(chan *client.Commit, messagesPerSecond*int(testDuration.Seconds()))
 	doneChannel := make(chan bool)
 	lastMessageChannel := make(chan int)
@@ -274,7 +270,7 @@ func (tc *TestClient) LatencyTest(messagesPerSecond int, testDuration time.Durat
 	tc.commitTimes = make([]time.Time, 0, messagesPerSecond*int(testDuration.Seconds()))
 	loopInterval := time.Second / time.Duration(messagesPerSecond)
 	// Debugging: Check my time math
-	slog.Debug(fmt.Sprintf("Test duration %v, sending %v messages per second, so loop interval is %v", testDuration, messagesPerSecond, loopInterval))
+	slog.Debug(fmt.Sprintf("Send loop interval is %v", loopInterval))
 	// Start a thread to receive commit pointers from the SubmitAsync calls and wait on them
 	go collectStatusesFlexible(putCommitChannel, tc.commitTimes, lastMessageChannel, doneChannel)
 	messageCounter := 0
