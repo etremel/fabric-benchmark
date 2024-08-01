@@ -40,6 +40,7 @@ const (
 )
 
 type TestClient struct {
+	idNum            int
 	userCertPath     string
 	userKeyPath      string
 	peerTlsCertPath  string
@@ -73,6 +74,7 @@ func main() {
 		fabricConfDir = path.Join(home, "fabric-samples", "config")
 	}
 	cryptoDir := flag.String("c", path.Join(fabricConfDir, "crypto-config"), "Root directory of the certificates directory")
+	testerID := flag.Int("i", 1, "ID number of this test client; needs to be unique if there are multiple test clients")
 	chaincodeName := flag.String("chaincode", defaultChaincodeName, "Name of the chaincode to invoke transactions on for testing")
 	channelName := flag.String("channel", defaultChannelName, "Name of the channel the test organizations have joined")
 	activeClientIP := flag.String("passive", "", "Sets this test client to passive mode; argument is the IP of the active client that will start the test")
@@ -148,6 +150,7 @@ func main() {
 
 	// Use the peer's hostname to build the path to its TLS certificate: certificates for each possible gateway peer are stored in peers/<hostname>/tls/ca.crt
 	testClient := TestClient{
+		idNum:           *testerID,
 		userCertPath:    path.Join(*cryptoDir, orgCryptoPath, userCertsSuffix),
 		userKeyPath:     path.Join(*cryptoDir, orgCryptoPath, userKeysSuffix),
 		peerName:        *gatewayPeerName,
@@ -354,11 +357,13 @@ func (tc *TestClient) saveTimestampFile() {
 	}
 	defer f.Close()
 	fileWriter := bufio.NewWriter(f)
+	// Prefix each message ID (counter) with the client's ID in the most-significant digit, so message IDs are unique across clients
+	messageIDPrefix := tc.idNum * 1000000000
 	for i := range len(tc.sendTimes) {
-		fileWriter.WriteString(fmt.Sprintf("%d %d %d\n", TLT_READY_TO_SEND, i, tc.sendTimes[i].UnixNano()))
+		fileWriter.WriteString(fmt.Sprintf("%d %d %d %d\n", TLT_READY_TO_SEND, tc.idNum, messageIDPrefix+i, tc.sendTimes[i].UnixNano()))
 	}
 	for i := range len(tc.commitTimes) {
-		fileWriter.WriteString(fmt.Sprintf("%d %d %d\n", TLT_EC_SIGNATURE_NOTIFY, i, tc.commitTimes[i].UnixNano()))
+		fileWriter.WriteString(fmt.Sprintf("%d %d %d %d\n", TLT_EC_SIGNATURE_NOTIFY, tc.idNum, messageIDPrefix+i, tc.commitTimes[i].UnixNano()))
 	}
 	fileWriter.Flush()
 }
