@@ -389,7 +389,8 @@ func (tc *TestClient) newGrpcConnection() {
 	certPool.AddCert(certificate)
 	transportCredentials := credentials.NewClientTLSFromCert(certPool, tc.peerName)
 
-	connection, err := grpc.NewClient(tc.peerEndpoint, grpc.WithTransportCredentials(transportCredentials))
+	connection, err := grpc.NewClient(tc.peerEndpoint, grpc.WithTransportCredentials(transportCredentials),
+		grpc.WithDefaultCallOptions(grpc.MaxCallSendMsgSize(104857600), grpc.MaxCallRecvMsgSize(104857600)))
 	if err != nil {
 		panic(fmt.Errorf("failed to create gRPC connection: %w", err))
 	}
