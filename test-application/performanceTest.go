@@ -33,7 +33,8 @@ const (
 	defaultChaincodeName = "plain_string"
 	defaultChannelName   = "mychannel"
 	defaultGatewayPeer   = "peer0.org1.example.com"
-	workloadSize         = 1024
+	defaultWorkloadSize  = 1024
+	maxWorkloadMemory    = 10485760000
 	timestampFileName    = "timestamp.log"
 	passiveClientPort    = "33333"
 	passiveClientDelay   = time.Duration(5) * time.Second
@@ -226,7 +227,13 @@ func main() {
 		slog.Debug(fmt.Sprintf("Passive client got a start message: %v.", startMessage))
 	}
 	// For both types of client, startMessage now contains all the parameters, so use them to start the test
-	slog.Debug("Generating workload")
+	var workloadSize int
+	if strings.EqualFold(startMessage.TestType, "throughput") {
+		workloadSize = min(defaultWorkloadSize, startMessage.NumMessages)
+	} else {
+		workloadSize = min(defaultWorkloadSize, maxWorkloadMemory/startMessage.DataSize)
+	}
+	slog.Debug(fmt.Sprintf("Generating workload: %v strings of size %v", workloadSize, startMessage.DataSize))
 	testClient.workloadObjects = generateWorkload(workloadSize, startMessage.DataSize)
 	slog.Debug("Waiting until start time...")
 	time.Sleep(time.Until(startMessage.StartTime))
