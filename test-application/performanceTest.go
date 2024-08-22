@@ -251,7 +251,7 @@ func (tc *TestClient) ThroughputTest(numTestUpdates int) {
 	tc.sendTimes = make([]time.Time, numTestUpdates)
 	tc.commitTimes = make([]time.Time, numTestUpdates)
 	// Start a thread to receive commit pointers from the SubmitAsync calls and wait on them
-	go collectStatusesFixed(putCommitChannel, tc.commitTimes, doneChannel)
+	go collectStatusesFixed(putCommitChannel, tc, doneChannel)
 	// Send a bunch of put updates, each targeting a random key, with the test data
 	// Measure the total time taken and divide by the total number of bytes sent to get the throughput
 	beginTime := time.Now()
@@ -269,6 +269,7 @@ func (tc *TestClient) ThroughputTest(numTestUpdates int) {
 	fmt.Printf("Duration: %v\nThroughput: %v bytes/sec (%v KB/s)\nOperations: %v ops\n",
 		totalDuration, throughputBps, (throughputBps / 1024), throughputOps)
 	tc.saveTimestampFile()
+	slog.Info("Test finished")
 }
 
 func (tc *TestClient) LatencyTest(messagesPerSecond int, testDuration time.Duration) {
@@ -282,7 +283,7 @@ func (tc *TestClient) LatencyTest(messagesPerSecond int, testDuration time.Durat
 	// Debugging: Check my time math
 	slog.Debug(fmt.Sprintf("Send loop interval is %v", loopInterval))
 	// Start a thread to receive commit pointers from the SubmitAsync calls and wait on them
-	go collectStatusesFlexible(putCommitChannel, tc.commitTimes, lastMessageChannel, doneChannel)
+	go collectStatusesFlexible(putCommitChannel, tc, lastMessageChannel, doneChannel)
 	messageCounter := 0
 	// Loop for the requested test duration
 	endTime := time.Now().Add(testDuration)
@@ -306,10 +307,11 @@ func (tc *TestClient) LatencyTest(messagesPerSecond int, testDuration time.Durat
 	slog.Debug("Waiting for collect-statuses thread to finish")
 	<-doneChannel
 	tc.saveTimestampFile()
+	slog.Info("Test finished")
 }
 
-func collectStatusesFixed(commitChannel <-chan *client.Commit, commitTimes []time.Time, done chan<- bool) {
-	for i := range len(commitTimes) {
+func collectStatusesFixed(commitChannel <-chan *client.Commit, testClient *TestClient, done chan<- bool) {
+	for i := range len(testClient.commitTimes) {
 		commitPtr := <-commitChannel
 		commitStatus, err := commitPtr.Status()
 		if err != nil {
@@ -318,13 +320,13 @@ func collectStatusesFixed(commitChannel <-chan *client.Commit, commitTimes []tim
 		if !commitStatus.Successful {
 			panic(fmt.Errorf("put transaction %v failed to commit, status was %+v", i, commitStatus))
 		}
-		commitTimes[i] = time.Now()
+		testClient.commitTimes[i] = time.Now()
 		slog.Debug(fmt.Sprintf("Transaction #%v finished with commit status %+v\n", i, commitStatus))
 	}
 	done <- true
 }
 
-func collectStatusesFlexible(commitChannel <-chan *client.Commit, commitTimes []time.Time,
+func collectStatusesFlexible(commitChannel <-chan *client.Commit, testClient *TestClient,
 	lastMessageChannel <-chan int, done chan<- bool) {
 	messageCounter := 0
 	var lastMessageNum int
@@ -338,7 +340,7 @@ func collectStatusesFlexible(commitChannel <-chan *client.Commit, commitTimes []
 		if !commitStatus.Successful {
 			panic(fmt.Errorf("put transaction %v failed to commit, status was %+v", messageCounter, commitStatus))
 		}
-		commitTimes = append(commitTimes, time.Now())
+		testClient.commitTimes = append(testClient.commitTimes, time.Now())
 		slog.Debug(fmt.Sprintf("Transaction #%v finished with commit status %+v\n", messageCounter, commitStatus))
 		select {
 		case lastMessageNum = <-lastMessageChannel:
