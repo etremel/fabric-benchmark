@@ -38,6 +38,10 @@ const (
 	timestampFileName    = "timestamp.log"
 	passiveClientPort    = "33333"
 	passiveClientDelay   = time.Duration(5) * time.Second
+	grpcEvaluateTimeout  = 5 * time.Second
+	grpcEndorseTimeout   = 15 * time.Second
+	grpcSubmitTimeout    = 10 * time.Second
+	commitStatusTimeout  = 1 * time.Minute
 )
 
 type TestClient struct {
@@ -169,10 +173,10 @@ func main() {
 		client.WithSign(sign),
 		client.WithClientConnection(testClient.clientConnection),
 		// Default timeouts for different gRPC calls
-		client.WithEvaluateTimeout(5*time.Second),
-		client.WithEndorseTimeout(15*time.Second),
-		client.WithSubmitTimeout(5*time.Second),
-		client.WithCommitStatusTimeout(1*time.Minute),
+		client.WithEvaluateTimeout(grpcEvaluateTimeout),
+		client.WithEndorseTimeout(grpcEndorseTimeout),
+		client.WithSubmitTimeout(grpcSubmitTimeout),
+		client.WithCommitStatusTimeout(commitStatusTimeout),
 	)
 	if err != nil {
 		panic(err)
@@ -292,7 +296,7 @@ func (tc *TestClient) LatencyTest(messagesPerSecond int, testDuration time.Durat
 		testObjectKey := fmt.Sprintf("testKey_%d", rand.Intn(len(tc.workloadObjects)))
 		waitTime := time.Until(lastSentTime.Add(loopInterval))
 		if waitTime < 0 {
-			slog.Warn("Send interval time has already elapsed, sending slower than the requested rate!")
+			slog.Debug("Send interval time has already elapsed, sending slower than the requested rate!")
 		}
 		time.Sleep(waitTime)
 		lastSentTime = time.Now()
@@ -307,7 +311,8 @@ func (tc *TestClient) LatencyTest(messagesPerSecond int, testDuration time.Durat
 	slog.Debug("Waiting for collect-statuses thread to finish")
 	<-doneChannel
 	tc.saveTimestampFile()
-	slog.Info("Test finished")
+	actualRate := messageCounter / int(testDuration.Seconds())
+	slog.Info(fmt.Sprintf("Test finished. Actual message rate: %v messages per second (%v requested)", actualRate, messagesPerSecond))
 }
 
 func collectStatusesFixed(commitChannel <-chan *client.Commit, testClient *TestClient, done chan<- bool) {
