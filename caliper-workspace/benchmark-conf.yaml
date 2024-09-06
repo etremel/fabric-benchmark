@@ -1,0 +1,46 @@
+test:
+  workers:
+    number: 5
+  rounds:
+    - label: Put 1KB data.
+      txNumber: 5000
+      rateControl:
+          type: fixed-load
+          opts:
+            transactionLoad: 50
+      workload:
+        module: putString.js
+        arguments:
+          dataSize: 1024
+          numDistinctObjects: 1024
+    - label: Put 10KB data.
+      txNumber: 5000
+      rateControl:
+          type: fixed-load
+          opts:
+            transactionLoad: 50
+      workload:
+        module: putString.js
+        arguments:
+          dataSize: 10240
+    - label: Put 1MB data.
+      txNumber: 1000
+      rateControl:
+          type: fixed-load
+          opts:
+            transactionLoad: 50
+      workload:
+        module: putString.js
+        arguments:
+          dataSize: 1048576
+    - label: Put 10MB data.
+      txNumber: 100
+      rateControl:
+          type: fixed-load
+          opts:
+            transactionLoad: 50
+      workload:
+        module: putString.js
+        arguments:
+          dataSize: 10485760
+          numDistinctObjects: 10
