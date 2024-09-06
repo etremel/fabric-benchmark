@@ -1,0 +1,19 @@
+caliper:
+  logging:
+    template: '%level%%module%%message%'
+    formats:
+      timestamp: false
+      label: false
+      json: false
+      pad: true
+      align: false
+      colorize: false
+    targets:
+      console:
+        enabled: true
+        options:
+          level: warn
+      file:
+        enabled: true
+        options:
+          level: info

@@ -44,3 +44,9 @@ test:
         arguments:
           dataSize: 10485760
           numDistinctObjects: 10
+
+monitors:
+  transaction:
+  - module: logging
+    options:
+      dummy: 1
