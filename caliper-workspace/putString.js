@@ -3,6 +3,8 @@
 
 const { WorkloadModuleBase } = require('@hyperledger/caliper-core');
 
+const fs = require('node:fs');
+
 function randomString(length) {
 	const characters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
 	const charactersLength = characters.Length;
@@ -28,6 +30,7 @@ class PutStringWorkload extends WorkloadModuleBase {
 		this.dataSize = 100;
 		this.numSampleData = 100;
 		this.sampleData = [];
+        this.transactionPromises = [];
     }
     /**
      * Initialize the workload module with the given parameters.
@@ -70,7 +73,24 @@ class PutStringWorkload extends WorkloadModuleBase {
             timeout: 30
         };
 
-        await this.sutAdapter.sendRequests(args);
+        let resultPromise = this.sutAdapter.sendRequests(args);
+        // Save the Promise<TxStatus> from sendRequests before returning it
+        this.transactionPromises.push(resultPromise);
+        return resultPromise;
+    }
+
+    /**
+     * Called once at the end of the round.
+     * Saves transaction completion timestamps to a file.
+     */
+    async cleanupWorkloadModule() {
+        let fileStream = fs.createWriteStream(`timestamp-${this.dataSize}_w${this.workerIndex}.log`, {flags: 'a'});
+        for (const txPromise of this.transactionPromises) {
+            // By this time all of the transactions should have completed, so the promise should be available right away
+            let transactionStatus = await txPromise;
+            fileStream.write(`${transactionStatus.GetID()} ${transactionStatus.GetTimeCreate()} ${transactionStatus.GetTimeFinal()}\n`);
+        }
+        fileStream.end();
     }
 }
 
