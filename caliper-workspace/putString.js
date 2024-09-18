@@ -7,7 +7,7 @@ const fs = require('node:fs');
 
 function randomString(length) {
 	const characters = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
-	const charactersLength = characters.Length;
+	const charactersLength = characters.length;
 	let result = '';
 	let counter = 0;
 	while (counter < length) {

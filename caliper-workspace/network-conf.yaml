@@ -23,22 +23,7 @@ organizations:
       # peer0.org1.example.com:7051 doesn't work
       - endpoint: 128.84.139.25:7051
         tlsCACerts:
-          pem: |-
-            -----BEGIN CERTIFICATE-----
-            MIICVjCCAf2gAwIBAgIQJV4C8fTXBArGS36P5v+yhDAKBggqhkjOPQQDAjB2MQsw
-            CQYDVQQGEwJVUzETMBEGA1UECBMKQ2FsaWZvcm5pYTEWMBQGA1UEBxMNU2FuIEZy
-            YW5jaXNjbzEZMBcGA1UEChMQb3JnMS5leGFtcGxlLmNvbTEfMB0GA1UEAxMWdGxz
-            Y2Eub3JnMS5leGFtcGxlLmNvbTAeFw0yNDA5MDMxMzM0MDBaFw0zNDA5MDExMzM0
-            MDBaMHYxCzAJBgNVBAYTAlVTMRMwEQYDVQQIEwpDYWxpZm9ybmlhMRYwFAYDVQQH
-            Ew1TYW4gRnJhbmNpc2NvMRkwFwYDVQQKExBvcmcxLmV4YW1wbGUuY29tMR8wHQYD
-            VQQDExZ0bHNjYS5vcmcxLmV4YW1wbGUuY29tMFkwEwYHKoZIzj0CAQYIKoZIzj0D
-            AQcDQgAEUEtqEMMGe1IcI5jvoANoECsU+hXSrNtDAmBmLn7gVfsEx35DAtPpGrv/
-            FeDfnQDqGVrEcbWrVmQyCqS8VT3T2aNtMGswDgYDVR0PAQH/BAQDAgGmMB0GA1Ud
-            JQQWMBQGCCsGAQUFBwMCBggrBgEFBQcDATAPBgNVHRMBAf8EBTADAQH/MCkGA1Ud
-            DgQiBCC4skfCu+L8gbTTyCWHQAwYoAj+8p842KcJ2fBCo/0tMzAKBggqhkjOPQQD
-            AgNHADBEAiBB1kNiiJRxqJwkIyyU/mMLsSODCAz8hhkyEvYu2QwFBQIgcJPsTZGY
-            lgDPRQ3+QIOedbUh97o2u7u/IdVKaT1f4Fg=
-            -----END CERTIFICATE-----
+          path: '/home/edward/fabric-samples/config/crypto-config/peerOrganizations/org1.example.com/peers/peer0.org1.example.com/tls/ca.crt'
         grpcOptions:
           ssl-target-name-override: peer0.org1.example.com
           grpc.keepalive_timeout_ms: 20000
