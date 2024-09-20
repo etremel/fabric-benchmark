@@ -29,6 +29,7 @@ class PutStringWorkload extends WorkloadModuleBase {
         this.txIndex = 0;
 		this.dataSize = 100;
 		this.numSampleData = 100;
+        this.maxRate = 0;
 		this.sampleData = [];
         this.transactionPromises = [];
     }
@@ -50,6 +51,11 @@ class PutStringWorkload extends WorkloadModuleBase {
 		if(this.roundArguments.hasOwnProperty('numDistinctObjects')) {
 			this.numSampleData = this.roundArguments.numDistinctObjects;
 		}
+        // If present, the maxRate argument just records the value passed to the fixed-rate controller
+        // so we can use it in the output file name
+        if(this.roundArguments.hasOwnProperty('maxRate')) {
+            this.maxRate = this.roundArguments.maxRate;
+        }
 		for(let i = 0; i < this.numSampleData; i++) {
 			this.sampleData.push(randomString(this.dataSize));
 		}
@@ -84,7 +90,14 @@ class PutStringWorkload extends WorkloadModuleBase {
      * Saves transaction completion timestamps to a file.
      */
     async cleanupWorkloadModule() {
-        let fileStream = fs.createWriteStream(`timestamp-${this.dataSize}_w${this.workerIndex}.log`, {flags: 'a'});
+        // Only include the message rate in the file name if it was provided
+        let fileName;
+        if(this.maxRate > 0) {
+            fileName = `timestamp-${this.dataSize}-r${this.maxRate}_w${this.workerIndex}.log`;
+        } else {
+            fileName = `timestamp-${this.dataSize}_w${this.workerIndex}.log`;
+        }
+        let fileStream = fs.createWriteStream(fileName, {flags: 'a'});
         for (const txPromise of this.transactionPromises) {
             // By this time all of the transactions should have completed, so the promise should be available right away
             let transactionStatus = await txPromise;
